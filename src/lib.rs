@@ -21,6 +21,11 @@
 //!   [`TranslateAcceleratorW`](https://docs.rs/windows-sys/latest/windows_sys/Win32/UI/WindowsAndMessaging/fn.TranslateAcceleratorW.html).
 //!   See [`Menu::init_for_hwnd`](https://docs.rs/muda/latest/x86_64-pc-windows-msvc/muda/struct.Menu.html#method.init_for_hwnd) for more details
 //!
+//! - On OpenHarmony, the backend depends on the `log` crate (upstream muda
+//!   does not) solely to emit diagnostics when a menu bridge call fails or is
+//!   skipped — there are no success or breadcrumb logs. Failures are also
+//!   cached and available through `last_bridge_error()` (OHOS only).
+//!
 //! # Dependencies (Linux Only)
 //!
 //! `gtk` is used for menus and `libxdo` is used to make the predfined `Copy`, `Cut`, `Paste` and `SelectAll` menu items work. Be sure to install following packages before building:
@@ -221,6 +226,52 @@ pub use platform_impl::send_menu_event;
 /// one FIFO queue, preventing flicker from out-of-order set_menu/remove_menu).
 #[cfg(target_env = "ohos")]
 pub use platform_impl::dispatch_menu_bridge_call;
+
+/// Sets the menubar visibility for a window (OHOS only), dispatched through
+/// the same dedicated worker thread as the menu data updates.
+#[cfg(target_env = "ohos")]
+pub use platform_impl::set_menubar_visible;
+
+/// Pushes a raw menu JSON snapshot to a window's menubar (OHOS only; an empty
+/// array clears it), dispatched through the same dedicated worker thread.
+#[cfg(target_env = "ohos")]
+pub use platform_impl::set_menu_json;
+
+/// Registers a handler that muda's OHOS backend invokes (on the bridge
+/// worker) after any menu data mutation — item text/enabled/checked/icon
+/// changes and add/remove/insert operations. Embedders use this to refresh
+/// the menubar in one place instead of after every individual menu API call.
+/// Mutations that arrive in a burst are coalesced into a single invocation.
+/// Pass `None` to clear the handler.
+#[cfg(target_env = "ohos")]
+pub fn set_on_menu_change<F: Fn() + Send + Sync + 'static>(handler: Option<F>) {
+    platform_impl::set_on_menu_change(handler.map(|f| Box::new(f) as _));
+}
+
+/// Returns the last OHOS menu bridge error (if any), without clearing it.
+///
+/// `Menu::popup` and `refresh_menubar` dispatch their bridge call to a worker
+/// thread (fire-and-forget — blocking the caller would deadlock the TSFN event
+/// loop), so a failure cannot be returned synchronously; it is cached here and
+/// also surfaced through the `Result` of the next popup/refresh_menubar call.
+/// Intended for embedder (tauri) diagnostics.
+#[cfg(target_env = "ohos")]
+pub use platform_impl::last_bridge_error;
+
+/// OHOS only: registers every check item in `menu` (recursively) as the
+/// process-wide check-state source — the map that click events flip and that
+/// `CheckMenuItem::is_checked` reads. tray-icon calls this when installing a
+/// menu on the status bar; it owns no item state of its own. Replaces any
+/// previous registration.
+#[cfg(target_env = "ohos")]
+pub use menu::register_check_items;
+
+/// OHOS only: toggles the registered check item `id`, emits its
+/// [`MenuEvent`], and returns the new state (`None` when `id` is not a
+/// registered check item). Single check-state source entry point used by
+/// tray-icon for status-bar check items.
+#[cfg(target_env = "ohos")]
+pub use platform_impl::toggle_check_item;
 
 /// An enumeration of all available menu types, useful to match against
 /// the items returned from [`Menu::items`] or [`Submenu::items`]

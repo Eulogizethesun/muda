@@ -65,6 +65,14 @@ static COUNTER: Counter = Counter::new();
 static CHECK_ITEMS: once_cell::sync::Lazy<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
 
+// ─── Check-state source (owned by muda) ─────────────────────────────────────
+// CHECK_ITEMS is the single source of truth for check-item state: it maps
+// item id → the same Arc<AtomicBool> the user's CheckMenuItem reads, so any
+// click — from the ArkTS menubar/popup path (start_event_listener) or from
+// tray-icon's status-bar menu (`toggle_check_item`) — flips the flag the user
+// observes through `CheckMenuItem::is_checked()`. Consumers keep no state
+// mirror of their own.
+
 // ─── MenuClient initialization (injected by tray-icon or tauri) ─────────────
 // muda does not hold an OpenHarmonyApp reference; tray-icon's set_ohos_app
 // creates a MenuClient and injects it here via set_menu_client().
@@ -88,8 +96,45 @@ pub fn set_menu_client(client: openharmony_ability_plugin_menu::MenuClient) {
     let _ = menu_event_receiver();
 }
 
-pub(crate) fn get_menu_client() -> &'static openharmony_ability_plugin_menu::MenuClient {
-    MENU_CLIENT.get().expect("MENU_CLIENT not initialized")
+// ─── Last bridge error (diagnostics for fire-and-forget calls) ───────────────
+// popup/refresh_menubar dispatch their bridge call to the worker thread and
+// cannot return its result without blocking the caller (see the worker docs
+// below). Instead, the worker caches the last failure here; the next
+// popup/refresh_menubar call surfaces it through its Result, and
+// `muda::last_bridge_error()` exposes it for embedder (tauri) diagnostics.
+
+static LAST_BRIDGE_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// Returns the last OHOS menu bridge error (if any), without clearing it.
+pub fn last_bridge_error() -> Option<String> {
+    LAST_BRIDGE_ERROR.lock().unwrap().clone()
+}
+
+/// Takes the pending bridge error, if any — used by popup/refresh_menubar to
+/// report the previous call's failure through their Result.
+fn take_last_bridge_error() -> Option<String> {
+    LAST_BRIDGE_ERROR.lock().unwrap().take()
+}
+
+/// Records a bridge failure from the worker thread.
+fn record_bridge_error(op: &str, err: &impl fmt::Display) {
+    log::warn!("[muda] {} error in worker: {}", op, err);
+    *LAST_BRIDGE_ERROR.lock().unwrap() = Some(format!("{}: {}", op, err));
+}
+
+/// Runs `f` with the MenuClient on the calling (worker) thread. A missing
+/// client is recorded as a bridge error instead of panicking: a panicking
+/// worker thread dies permanently and silently drops every subsequent menu
+/// bridge call.
+fn with_menu_client(op: &str, f: impl FnOnce(&openharmony_ability_plugin_menu::MenuClient)) {
+    match MENU_CLIENT.get() {
+        Some(client) => f(client),
+        None => {
+            log::error!("[muda] {} skipped: MENU_CLIENT not initialized", op);
+            *LAST_BRIDGE_ERROR.lock().unwrap() =
+                Some(format!("{}: MENU_CLIENT not initialized", op));
+        }
+    }
 }
 
 // ─── Menu event channel (owned by muda) ─────────────────────────────────────
@@ -150,10 +195,74 @@ fn menu_bridge_worker_tx() -> &'static std::sync::mpsc::Sender<MenuBridgeCommand
     &TX
 }
 
+/// Sets the menubar visibility for a window, routed through the dedicated
+/// worker thread so visibility toggles and data updates (`refresh_menubar`,
+/// `set_menu_json`) keep one FIFO order (an out-of-order remove_menu could
+/// land after real data and clear the menu bar).
+pub fn set_menubar_visible(visible: bool, window_id: &str) {
+    let request = openharmony_ability_plugin_menu::MenuSetVisibleRequest {
+        visible,
+        window_id: window_id.to_string(),
+    };
+    dispatch_menu_bridge_call(move || {
+        with_menu_client("set_menubar_visible", |client| {
+            if let Err(e) = futures_executor::block_on(client.set_menubar_visible(request)) {
+                record_bridge_error("set_menubar_visible", &e);
+            }
+        });
+    });
+}
+
+/// Pushes a raw menu JSON snapshot to a window's menubar (an empty array
+/// clears it), routed through the dedicated worker thread — same FIFO
+/// rationale as [`set_menubar_visible`].
+pub fn set_menu_json(json_data: &str, window_id: &str) {
+    let json_data = json_data.to_string();
+    let window_id = window_id.to_string();
+    dispatch_menu_bridge_call(move || {
+        with_menu_client("set_menu_json", |client| {
+            if let Err(e) = futures_executor::block_on(client.set_menu_json(json_data, window_id)) {
+                record_bridge_error("set_menu_json", &e);
+            }
+        });
+    });
+}
+
 /// Dispatch a menu bridge call to the dedicated worker thread (fire-and-forget).
 pub fn dispatch_menu_bridge_call(f: impl FnOnce() + Send + 'static) {
     if menu_bridge_worker_tx().send(Box::new(f)).is_err() {
         log::warn!("[muda] menu bridge worker channel closed, call dropped");
+    }
+}
+
+/// Handler invoked after any menu data mutation, used by embedders (e.g.
+/// tauri) to re-render the menubar. Runs on the menu bridge worker.
+type MenuChangeHandler = Box<dyn Fn() + Send + Sync>;
+
+static MENU_CHANGE_HANDLER: std::sync::RwLock<Option<MenuChangeHandler>> =
+    std::sync::RwLock::new(None);
+
+/// Registers (or, with `None`, clears) the menu-change handler.
+pub fn set_on_menu_change(handler: Option<MenuChangeHandler>) {
+    *MENU_CHANGE_HANDLER.write().unwrap() = handler;
+}
+
+// Coalescing flag: a burst of mutations (e.g. `append_items` looping over
+// `append`) enqueues a single notification task — the task that wins the race
+// clears the flag and invokes the handler, so the menubar is refreshed once
+// per burst instead of once per mutation.
+static MENU_CHANGE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Notifies the registered menu-change handler that menu data was mutated.
+/// Called at the end of every mutating method in this backend.
+fn notify_menu_change() {
+    if !MENU_CHANGE_PENDING.swap(true, Ordering::AcqRel) {
+        dispatch_menu_bridge_call(|| {
+            MENU_CHANGE_PENDING.store(false, Ordering::Release);
+            if let Some(handler) = MENU_CHANGE_HANDLER.read().unwrap().as_ref() {
+                handler();
+            }
+        });
     }
 }
 
@@ -179,6 +288,7 @@ impl Menu {
             AddOp::Append => self.children.push(item.child()),
             AddOp::Insert(position) => self.children.insert(position, item.child()),
         }
+        notify_menu_change();
         Ok(())
     }
 
@@ -189,6 +299,7 @@ impl Menu {
             .position(|e: &Rc<RefCell<MenuChild>>| e.borrow().id == item.id())
             .ok_or(crate::Error::NotAChildOfThisMenu)?;
         self.children.remove(index);
+        notify_menu_change();
         Ok(())
     }
 
@@ -197,6 +308,15 @@ impl Menu {
             .iter()
             .map(|c: &Rc<RefCell<MenuChild>>| c.borrow().kind(c.clone()))
             .collect()
+    }
+
+    /// Registers this menu's check items (recursively) as the process-wide
+    /// check-state source, replacing any previous registration — see
+    /// `CHECK_ITEMS`. tray-icon calls the public `muda::register_check_items`
+    /// wrapper when installing a menu on the status bar, so its click events
+    /// flip the user's `CheckMenuItem` flags.
+    pub fn register_check_items(&self) {
+        collect_check_items(&self.children);
     }
 
     pub fn to_menu_items(&self) -> Vec<MenuItemData> {
@@ -211,31 +331,19 @@ impl Menu {
     }
 
     pub fn popup(&self, x: Option<f64>, y: Option<f64>, window_id: &str) -> crate::Result<()> {
-        init_menu_event_listener();
-        collect_check_items(&self.children);
-        let json = self.to_json();
-        let request = openharmony_ability_plugin_menu::MenuPopupRequest {
-            json_data: json,
-            x,
-            y,
-            window_id: window_id.to_string(),
-        };
-        // Dispatch to the menu bridge worker (fire-and-forget). The bridge call
-        // must NOT run on the main thread: block_on + receiver.await would
-        // deadlock the TSFN event loop (THREAD_BLOCK_6S).
-        log::info!("[muda] popup: dispatching to worker");
-        dispatch_menu_bridge_call(move || {
-            let client = get_menu_client();
-            log::info!("[muda] worker: popup before block_on");
-            if let Err(e) = futures_executor::block_on(client.popup(request)) {
-                log::warn!("[muda] popup error in worker: {}", e);
-            }
-        });
-        Ok(())
+        dispatch_popup(&self.children, x, y, window_id)
     }
 
     pub fn refresh_menubar(&self, window_id: &str) -> crate::Result<()> {
+        if let Some(err) = take_last_bridge_error() {
+            return Err(crate::Error::OhosBridgeError(err));
+        }
         init_menu_event_listener();
+        // Same registration as the popup path: menubar check items must flip
+        // the shared flags on click, or `CheckMenuItem::is_checked()` returns
+        // a stale value. collect_check_items clears and rebuilds the map, so
+        // this is idempotent.
+        collect_check_items(&self.children);
         let json = self.to_json();
         let request = openharmony_ability_plugin_menu::MenuSetMenubarRequest {
             json_data: json,
@@ -244,16 +352,58 @@ impl Menu {
         // Dispatch to the menu bridge worker (fire-and-forget). Without this,
         // window creation's refresh_menubar blocks the main thread on
         // set_menubar's receiver.await → deadlock (THREAD_BLOCK_6S).
-        log::info!("[muda] refresh_menubar: dispatching to worker");
         dispatch_menu_bridge_call(move || {
-            let client = get_menu_client();
-            log::info!("[muda] worker: set_menubar before block_on");
-            if let Err(e) = futures_executor::block_on(client.set_menubar(request)) {
-                log::warn!("[muda] set_menubar error in worker: {}", e);
-            }
+            with_menu_client("set_menubar", |client| {
+                if let Err(e) = futures_executor::block_on(client.set_menubar(request)) {
+                    record_bridge_error("set_menubar", &e);
+                }
+            });
         });
         Ok(())
     }
+}
+
+/// Shared implementation of [`Menu::popup`] and [`MenuChild::popup`]:
+/// registers the tree's check items (so click events flip the same flags the
+/// user's `CheckMenuItem` reads), serializes `children`, and dispatches the
+/// popup bridge call to the worker.
+///
+/// Fire-and-forget: the call must NOT run on the main thread — block_on +
+/// receiver.await would deadlock the TSFN event loop (THREAD_BLOCK_6S) — so
+/// the worker caches any failure in `LAST_BRIDGE_ERROR`, which the next
+/// popup/refresh_menubar call surfaces through its Result.
+fn dispatch_popup(
+    children: &[Rc<RefCell<MenuChild>>],
+    x: Option<f64>,
+    y: Option<f64>,
+    window_id: &str,
+) -> crate::Result<()> {
+    if let Some(err) = take_last_bridge_error() {
+        return Err(crate::Error::OhosBridgeError(err));
+    }
+    init_menu_event_listener();
+    collect_check_items(children);
+    let json = serde_json::to_string(
+        &children
+            .iter()
+            .map(|c| c.borrow().to_menu_item_data())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_default();
+    let request = openharmony_ability_plugin_menu::MenuPopupRequest {
+        json_data: json,
+        x,
+        y,
+        window_id: window_id.to_string(),
+    };
+    dispatch_menu_bridge_call(move || {
+        with_menu_client("popup", |client| {
+            if let Err(e) = futures_executor::block_on(client.popup(request)) {
+                record_bridge_error("popup", &e);
+            }
+        });
+    });
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -265,7 +415,6 @@ pub struct MenuChild {
     accelerator: Option<KeyAccelerator>,
     predefined_item_type: Option<PredefinedMenuItemType>,
     checked: Option<Arc<AtomicBool>>,
-    is_syncing_checked_state: Option<Arc<AtomicBool>>,
     icon: Option<Icon>,
     native_icon: Option<String>,
     pub children: Option<Vec<Rc<RefCell<MenuChild>>>>,
@@ -288,7 +437,6 @@ impl MenuChild {
             children: None,
             icon: None,
             native_icon: None,
-            is_syncing_checked_state: None,
             predefined_item_type: None,
         }
     }
@@ -302,7 +450,6 @@ impl MenuChild {
             item_type: MenuItemType::Submenu,
             icon: None,
             native_icon: None,
-            is_syncing_checked_state: None,
             predefined_item_type: None,
             accelerator: None,
             checked: None,
@@ -321,7 +468,6 @@ impl MenuChild {
             children: None,
             icon: None,
             native_icon: None,
-            is_syncing_checked_state: None,
         }
     }
 
@@ -336,7 +482,6 @@ impl MenuChild {
             text: text.to_string(),
             enabled,
             checked: Some(Arc::new(AtomicBool::new(checked))),
-            is_syncing_checked_state: Some(Arc::new(AtomicBool::new(false))),
             accelerator: key_accelerator,
             id: id.unwrap_or_else(|| MenuId(COUNTER.next().to_string())),
             item_type: MenuItemType::Check,
@@ -364,7 +509,6 @@ impl MenuChild {
             item_type: MenuItemType::Icon,
             children: None,
             checked: None,
-            is_syncing_checked_state: None,
             predefined_item_type: None,
         }
     }
@@ -386,7 +530,6 @@ impl MenuChild {
             checked: None,
             icon: None,
             native_icon: native_icon.and_then(native_icon_to_ohos).map(|s| s.to_string()),
-            is_syncing_checked_state: None,
             predefined_item_type: None,
         }
     }
@@ -458,7 +601,10 @@ impl MenuChild {
         MenuItemData {
             id: self.id.0.clone(),
             item_type: item_type.to_string(),
-            text: Some(self.text.replace("&", "")),
+            // Mnemonics (&X) are kept in the serialized text — the single
+            // stripping point (with && escape handling) is the status-bar
+            // consumer in tray-icon, not the serializer.
+            text: Some(self.text.clone()),
             enabled: Some(self.enabled),
             accelerator: self.accelerator.clone().map(|k| k.to_string()),
             predefined_type,
@@ -500,6 +646,7 @@ impl MenuChild {
 
     pub fn set_text(&mut self, text: &str) {
         self.text = text.to_string();
+        notify_menu_change();
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -508,6 +655,7 @@ impl MenuChild {
 
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+        notify_menu_change();
     }
 
     pub fn set_key_accelerator(
@@ -515,6 +663,7 @@ impl MenuChild {
         accelerator: Option<KeyAccelerator>,
     ) -> crate::Result<()> {
         self.accelerator = accelerator;
+        notify_menu_change();
         Ok(())
     }
 }
@@ -531,23 +680,19 @@ impl MenuChild {
         if let Some(c) = &self.checked {
             c.store(checked, Ordering::Release);
         }
-        if let Some(is_syncing) = &self.is_syncing_checked_state {
-            is_syncing.store(false, Ordering::Release);
-        }
+        notify_menu_change();
     }
-}
 
-impl MenuChild {
-pub fn set_icon(&mut self, icon: Option<Icon>) {
+    pub fn set_icon(&mut self, icon: Option<Icon>) {
         self.icon = icon;
+        notify_menu_change();
     }
 
     pub fn set_native_icon(&mut self, icon: Option<NativeIcon>) {
         self.native_icon = icon.and_then(native_icon_to_ohos).map(|s| s.to_string());
+        notify_menu_change();
     }
-}
 
-impl MenuChild {
     pub fn add_menu_item(&mut self, item: &dyn IsMenuItem, op: AddOp) -> crate::Result<()> {
         match op {
             AddOp::Append => self.children.as_mut().unwrap().push(item.child()),
@@ -557,6 +702,7 @@ impl MenuChild {
                 .unwrap()
                 .insert(position, item.child()),
         }
+        notify_menu_change();
         Ok(())
     }
 
@@ -569,6 +715,7 @@ impl MenuChild {
             .position(|e: &Rc<RefCell<MenuChild>>| e.borrow().id == item.id())
             .ok_or(crate::Error::NotAChildOfThisMenu)?;
         self.children.as_mut().unwrap().remove(index);
+        notify_menu_change();
         Ok(())
     }
 
@@ -589,25 +736,9 @@ impl MenuChild {
     }
 
     pub fn popup(&self, x: Option<f64>, y: Option<f64>, window_id: &str) -> crate::Result<()> {
-        init_menu_event_listener();
         if let Some(ref children) = self.children {
-            collect_check_items(children);
+            dispatch_popup(children, x, y, window_id)?;
         }
-        let json = self.to_json();
-        let request = openharmony_ability_plugin_menu::MenuPopupRequest {
-            json_data: json,
-            x,
-            y,
-            window_id: window_id.to_string(),
-        };
-        // Dispatch to the menu bridge worker (fire-and-forget) — see Menu::popup.
-        log::info!("[muda] submenu popup: dispatching to worker");
-        dispatch_menu_bridge_call(move || {
-            let client = get_menu_client();
-            if let Err(e) = futures_executor::block_on(client.popup(request)) {
-                log::warn!("[muda] popup error in submenu worker: {}", e);
-            }
-        });
         Ok(())
     }
 }
@@ -645,6 +776,25 @@ fn collect_check_item_recursive(child: &MenuChild, map: &mut HashMap<String, Arc
             collect_check_item_recursive(&sub.borrow(), map);
         }
     }
+}
+
+/// Toggles the registered check item `id`, emits its
+/// [`MenuEvent`](crate::MenuEvent), and returns the new state — `None` when
+/// `id` is not a registered check item. This is the single-state-source flip
+/// tray-icon uses for status-bar check items: the status bar delivers clicks
+/// to tray-icon, which owns no item state of its own.
+pub fn toggle_check_item(id: &str) -> Option<bool> {
+    let new_checked = {
+        let guard = CHECK_ITEMS.lock().unwrap();
+        let checked = guard.get(id)?;
+        let old = checked.load(Ordering::Relaxed);
+        checked.store(!old, Ordering::Release);
+        !old
+    };
+    crate::MenuEvent::send(crate::MenuEvent {
+        id: crate::MenuId::new(id.to_string()),
+    });
+    Some(new_checked)
 }
 
 fn start_event_listener() {
@@ -808,17 +958,19 @@ mod tests {
     }
 
     #[test]
-    fn menu_child_ampersand_stripped() {
+    fn menu_child_ampersand_preserved() {
+        // Mnemonic stripping is the status-bar consumer's job (tray-icon);
+        // the serializer keeps the raw text.
         let child = MenuChild::new("Save &As", true, None, None);
         let data = child.to_menu_item_data();
-        assert_eq!(data.text, Some("Save As".to_string()));
+        assert_eq!(data.text, Some("Save &As".to_string()));
     }
 
     #[test]
-    fn menu_child_double_ampersand_stripped() {
+    fn menu_child_double_ampersand_preserved() {
         let child = MenuChild::new("A&&B", true, None, None);
         let data = child.to_menu_item_data();
-        assert_eq!(data.text, Some("AB".to_string()));
+        assert_eq!(data.text, Some("A&&B".to_string()));
     }
 
     #[test]
@@ -1268,6 +1420,45 @@ mod tests {
     fn regular_item_is_checked_returns_false() {
         let child = MenuChild::new("Regular", true, None, None);
         assert!(!child.is_checked());
+    }
+
+    // ─── toggle_check_item (single check-state source) ────────────────────
+
+    #[test]
+    fn toggle_check_item_flips_registered_flag() {
+        // Save global state and restore at the end to avoid leaking across tests.
+        let saved = std::mem::take(&mut *CHECK_ITEMS.lock().unwrap());
+        let flag = Arc::new(AtomicBool::new(false));
+        CHECK_ITEMS
+            .lock()
+            .unwrap()
+            .insert("toggle_me".to_string(), flag.clone());
+        assert_eq!(toggle_check_item("toggle_me"), Some(true));
+        assert_eq!(toggle_check_item("toggle_me"), Some(false));
+        assert!(flag.load(Ordering::Relaxed));
+        *CHECK_ITEMS.lock().unwrap() = saved;
+    }
+
+    #[test]
+    fn toggle_check_item_unknown_id_returns_none() {
+        assert_eq!(toggle_check_item("no_such_item"), None);
+    }
+
+    #[test]
+    fn register_check_items_registers_menu_tree() {
+        // Save global state and restore at the end to avoid leaking across tests.
+        let saved = std::mem::take(&mut *CHECK_ITEMS.lock().unwrap());
+        let mut menu = Menu::new(None);
+        menu.children.push(Rc::new(RefCell::new(MenuChild::new_check(
+            "A",
+            true,
+            true,
+            None,
+            Some(MenuId::new("reg_check")),
+        ))));
+        menu.register_check_items();
+        assert!(CHECK_ITEMS.lock().unwrap().contains_key("reg_check"));
+        *CHECK_ITEMS.lock().unwrap() = saved;
     }
 
     // ─── Predefined item types ────────────────────────────────────────────
