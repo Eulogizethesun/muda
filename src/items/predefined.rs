@@ -257,7 +257,7 @@ pub(crate) enum PredefinedMenuItemType {
     ShowAll,
     CloseWindow,
     Quit,
-    About(#[allow(dead_code)] Option<AboutMetadata>),
+    About(Option<AboutMetadata>),
     Services,
     BringAllToFront,
     #[default]

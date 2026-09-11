@@ -50,6 +50,26 @@ pub use self::platform::send_menu_event;
 /// empty "remove_menu" dispatch from a different executor).
 #[cfg(target_env = "ohos")]
 pub use self::platform::dispatch_menu_bridge_call;
+#[cfg(target_env = "ohos")]
+pub use self::platform::{set_menu_json, set_menubar_visible};
+
+/// Public re-export so embedders (tauri) can subscribe to menu data mutations:
+/// the OHOS backend invokes the handler (on the bridge worker) after every
+/// mutation, which is how the menubar refresh stays in sync without each
+/// caller refreshing manually.
+#[cfg(target_env = "ohos")]
+pub use self::platform::set_on_menu_change;
+
+/// Public re-export of the cached last OHOS bridge failure: popup/refresh_
+/// menubar are fire-and-forget on the worker, so embedders poll this for
+/// diagnostics instead of getting the error synchronously.
+#[cfg(target_env = "ohos")]
+pub use self::platform::last_bridge_error;
+
+/// Public re-export so tray-icon can flip muda's single check-state source
+/// when a status-bar check item is clicked (it owns no item state of its own).
+#[cfg(target_env = "ohos")]
+pub use self::platform::toggle_check_item;
 
 impl dyn IsMenuItem + '_ {
     fn child(&self) -> Rc<RefCell<MenuChild>> {
