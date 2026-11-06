@@ -536,6 +536,16 @@ impl ContextMenu for Menu {
     }
 }
 
+/// OHOS only: registers every check item in `menu` (recursively) as the
+/// process-wide check-state source — the map that click events flip and that
+/// [`CheckMenuItem::is_checked`](crate::CheckMenuItem::is_checked) reads.
+/// tray-icon calls this when installing a menu on the status bar; it owns no
+/// item state of its own. Replaces any previous registration.
+#[cfg(target_env = "ohos")]
+pub fn register_check_items(menu: &Menu) {
+    menu.inner.borrow().register_check_items();
+}
+
 /// The window menu bar theme
 #[cfg(windows)]
 #[repr(usize)]

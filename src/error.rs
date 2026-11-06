@@ -44,10 +44,14 @@ pub enum Error {
     AlreadyInitialized,
     #[error(transparent)]
     AcceleratorParseError(#[from] AcceleratorParseError),
-    #[error("Custom error: {0}")]
-    CustomError(String),
-    #[error("Operation not supported on this platform")]
-    NotSupportedOnPlatform,
+    /// A menu bridge call failed on the OpenHarmony worker thread. Retained
+    /// for API compatibility only — the OHOS backend no longer constructs
+    /// this variant (bridge calls are fire-and-forget; a stale failure must
+    /// not block or swallow the current call's dispatch). Bridge failures
+    /// are exposed via `muda::last_bridge_error()` instead.
+    #[cfg(target_env = "ohos")]
+    #[error("OHOS menu bridge error: {0}")]
+    OhosBridgeError(String),
 }
 
 /// Convenient type alias of Result type for muda.
